@@ -92,6 +92,42 @@ function isPlayerlistMessage(content) {
   return normalizeDiscordContent(content).toLowerCase() === 'playerlist';
 }
 
+// The user's own slot numbering for the Dropinv command, chosen
+// by the user: counting starts at the BOTTOM-LEFT of the screen
+// (the hotbar's leftmost slot is 1) and goes up row by row:
+//   user  1-9   = hotbar        (window 36-44)
+//   user 10-18  = bag row above hotbar (window 27-35)
+//   user 19-27  = next bag row  (window 18-26)
+//   user 28-36  = top bag row   (window  9-17)
+const USER_ROW_WINDOW_STARTS = [36, 27, 18, 9];
+
+function userSlotToWindowSlot(userSlot) {
+  if (!Number.isInteger(userSlot) || userSlot < 1 || userSlot > 36) return null;
+  const row = Math.floor((userSlot - 1) / 9); // 0 = hotbar (bottom)
+  const col = (userSlot - 1) % 9;
+  return USER_ROW_WINDOW_STARTS[row] + col;
+}
+
+// Parses the custom Discord command for dropping inventory items.
+// There is deliberately NO drop-everything mode (the user said
+// they do not want one) — a slot number is always required:
+//   "Dropinv 8"    -> { mode: 'slot', userSlot: 8, windowSlot: 43 }
+//   "Dropinv"      -> { mode: 'invalid' } (number missing)
+//   "Dropinv xyz"  -> { mode: 'invalid' } (starts like the command)
+//   anything else  -> null (not a drop command)
+function parseDropCommand(content) {
+  const text = normalizeDiscordContent(content);
+  const mSlot = text.match(/^dropinv\s+(\d{1,2})$/i);
+  if (mSlot) {
+    const userSlot = parseInt(mSlot[1], 10);
+    const windowSlot = userSlotToWindowSlot(userSlot);
+    if (windowSlot !== null) return { mode: 'slot', userSlot, windowSlot };
+    return { mode: 'invalid' };
+  }
+  if (/^dropinv(\s|$)/i.test(text)) return { mode: 'invalid' };
+  return null;
+}
+
 function formatPlayerList(usernames) {
   const names = Array.isArray(usernames) ? usernames : [];
   return `Server ${names.length} online: ${names.join(', ')}`;
@@ -151,6 +187,8 @@ let crouching = false;
 const lastGreetedAt = new Map(); // username -> last greet timestamp
 // username -> { inside, anchorPos, stillSince, lookingSince }
 const playerWatchState = new Map();
+
+let dropping = false; // one drop operation at a time
 
 let discordClient = null;
 let discordChannel = null;
@@ -296,6 +334,65 @@ function scheduleReconnect(wasSpawned) {
   }, delay);
 }
 
+// Finds the nearest other player within `range` blocks of
+// `myPos` from a list of entities (pure — unit tested).
+// Returns the entity, or null when nobody is that close.
+function nearestPlayerWithin(myPos, entities, range, selfUsername) {
+  if (!myPos || !Array.isArray(entities)) return null;
+  let best = null;
+  let bestDist = Infinity;
+  for (const e of entities) {
+    if (!e || e.type !== 'player' || !e.username || e.username === selfUsername || !e.position) continue;
+    const d = myPos.distanceTo(e.position);
+    if (d <= range && d < bestDist) {
+      best = e;
+      bestDist = d;
+    }
+  }
+  return best;
+}
+
+// Drops inventory items for the Dropinv command. Returns a
+// human-readable result string for the Discord reply, with the
+// real counts/names read from the live inventory — or null when
+// the bot is not in the game.
+async function dropInventory(dropCmd) {
+  if (!bot || !bot.entity || !bot.inventory) return null;
+  if (dropping) return 'A drop is already in progress — wait for it to finish.';
+  dropping = true;
+  try {
+    const item = bot.inventory.slots[dropCmd.windowSlot];
+    if (!item) return `Slot ${dropCmd.userSlot} is empty — nothing to drop.`;
+    const label = `${item.displayName || item.name} x${item.count}`;
+
+    // If a player is standing nearby (within 6 blocks), face
+    // them first: a tossed item flies in the direction the bot
+    // is looking, so it lands towards that player. Aim a little
+    // low (mid-body) so the item does not sail over their head.
+    let facedName = null;
+    const nearby = nearestPlayerWithin(
+      bot.entity.position,
+      Object.values(bot.entities || {}),
+      GREET_RANGE_BLOCKS,
+      bot.username);
+    if (nearby) {
+      try {
+        await bot.lookAt(nearby.position.offset(0, 1.0, 0), true);
+        await sleep(250); // let the server register the new facing
+        facedName = nearby.username;
+      } catch {}
+    }
+
+    await bot.tossStack(item);
+    log(`Dropinv: dropped user slot ${dropCmd.userSlot} (window ${dropCmd.windowSlot}, ${label})${facedName ? ` towards ${facedName}` : ''}.`);
+    return facedName
+      ? `Dropped slot ${dropCmd.userSlot}: ${label} (towards ${facedName}).`
+      : `Dropped slot ${dropCmd.userSlot}: ${label}.`;
+  } finally {
+    dropping = false;
+  }
+}
+
 function getOnlinePlayerNames() {
   if (!bot || !bot.players) return null;
   return Object.keys(bot.players);
@@ -435,6 +532,26 @@ async function handleDiscordMessage(message) {
     return;
   }
 
+  // "Dropinv" / "Dropinv <slot>" is handled by the bot itself
+  // and never sent into Minecraft chat.
+  const dropCmd = parseDropCommand(content);
+  if (dropCmd) {
+    try {
+      if (dropCmd.mode === 'invalid') {
+        await message.reply('Usage: `Dropinv <number>` drops one slot — a number is required, e.g. `Dropinv 8`. Slots count 1-36 from the bottom-left: hotbar 1-9, then the rows above it 10-18, 19-27, 28-36.');
+      } else {
+        const result = await dropInventory(dropCmd);
+        await message.reply(result === null
+          ? 'Bot is not connected to Minecraft right now — it reconnects automatically, try again in a moment.'
+          : result);
+      }
+    } catch (err) {
+      log('Discord: Dropinv failed:', err.message);
+      try { await message.reply('Dropping failed — the bot may have just disconnected.'); } catch {}
+    }
+    return;
+  }
+
   if (!bot || !bot.entity) {
     try {
       await message.reply('Bot is not connected to Minecraft right now — it reconnects automatically, try again in a moment.');
@@ -542,6 +659,9 @@ module.exports = {
   RecentKeys,
   normalizeDiscordContent,
   isPlayerlistMessage,
+  parseDropCommand,
+  userSlotToWindowSlot,
+  nearestPlayerWithin,
   formatPlayerList,
   yawToFace,
   angularDifference,

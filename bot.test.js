@@ -11,6 +11,9 @@ const {
   RecentKeys,
   normalizeDiscordContent,
   isPlayerlistMessage,
+  parseDropCommand,
+  userSlotToWindowSlot,
+  nearestPlayerWithin,
   formatPlayerList,
   yawToFace,
   angularDifference,
@@ -74,6 +77,63 @@ test('parseMessagestrAsPlayerChat accepts real chat formats', () => {
   assert.deepEqual(
     parseMessagestrAsPlayerChat('[VIP] Steve » ranked hello', online, 'SASUKE_440'),
     { username: 'Steve', message: 'ranked hello' });
+});
+
+test('userSlotToWindowSlot counts 1-36 from the bottom-left, going up', () => {
+  // User's inventory photo: hotbar sword = 1, ender pearl = 8,
+  // top-left ice = 28, top-right arrows = 36.
+  assert.equal(userSlotToWindowSlot(1), 36); // hotbar left -> window 36
+  assert.equal(userSlotToWindowSlot(8), 43); // ender pearl
+  assert.equal(userSlotToWindowSlot(9), 44); // hotbar right
+  assert.equal(userSlotToWindowSlot(10), 27); // row above hotbar, left
+  assert.equal(userSlotToWindowSlot(18), 35);
+  assert.equal(userSlotToWindowSlot(19), 18);
+  assert.equal(userSlotToWindowSlot(28), 9); // top-left ice
+  assert.equal(userSlotToWindowSlot(36), 17); // top-right
+  assert.equal(userSlotToWindowSlot(0), null);
+  assert.equal(userSlotToWindowSlot(37), null);
+});
+
+test('parseDropCommand: a slot number is required — bare Dropinv drops nothing', () => {
+  assert.deepEqual(parseDropCommand('Dropinv'), { mode: 'invalid' });
+  assert.deepEqual(parseDropCommand('  DROPINV '), { mode: 'invalid' });
+});
+
+test('parseDropCommand: with a user slot number it drops that one slot', () => {
+  assert.deepEqual(parseDropCommand('Dropinv 1'), { mode: 'slot', userSlot: 1, windowSlot: 36 });
+  assert.deepEqual(parseDropCommand('Dropinv 8'), { mode: 'slot', userSlot: 8, windowSlot: 43 });
+  assert.deepEqual(parseDropCommand('dropinv 28'), { mode: 'slot', userSlot: 28, windowSlot: 9 });
+  assert.deepEqual(parseDropCommand('Dropinv 36'), { mode: 'slot', userSlot: 36, windowSlot: 17 });
+});
+
+test('parseDropCommand: out-of-range slots and bad arguments are invalid, other text is not a drop command', () => {
+  assert.deepEqual(parseDropCommand('Dropinv 0'), { mode: 'invalid' });
+  assert.deepEqual(parseDropCommand('Dropinv 37'), { mode: 'invalid' });
+  assert.deepEqual(parseDropCommand('Dropinv 45'), { mode: 'invalid' });
+  assert.deepEqual(parseDropCommand('Dropinv abc'), { mode: 'invalid' });
+  assert.deepEqual(parseDropCommand('Dropinv 8 please'), { mode: 'invalid' });
+  assert.equal(parseDropCommand('Dropinventory please'), null);
+  assert.equal(parseDropCommand('Hi'), null);
+  assert.equal(parseDropCommand('Playerlist'), null);
+});
+
+test('nearestPlayerWithin picks the closest other player in range, nobody else', () => {
+  const pos = (x, z) => ({
+    x, y: 64, z,
+    distanceTo(other) { return Math.hypot(this.x - other.x, this.z - other.z); },
+  });
+  const me = pos(0, 0);
+  const entities = [
+    { type: 'player', username: 'SASUKE_440', position: pos(0, 0) }, // the bot itself
+    { type: 'player', username: 'FarPlayer', position: pos(20, 0) }, // out of range
+    { type: 'player', username: 'NearPlayer', position: pos(3, 0) },
+    { type: 'player', username: 'NearerPlayer', position: pos(1, 1) },
+    { type: 'mob', username: 'Zombie', position: pos(1, 0) }, // not a player
+  ];
+  assert.equal(nearestPlayerWithin(me, entities, 6, 'SASUKE_440').username, 'NearerPlayer');
+  assert.equal(nearestPlayerWithin(me, entities.slice(0, 2), 6, 'SASUKE_440'), null);
+  assert.equal(nearestPlayerWithin(me, [], 6, 'SASUKE_440'), null);
+  assert.equal(nearestPlayerWithin(null, entities, 6, 'SASUKE_440'), null);
 });
 
 test('parseMessagestrAsPlayerChat rejects system lines, strangers and the bot itself', () => {
