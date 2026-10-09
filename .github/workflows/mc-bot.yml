@@ -32,4 +32,8 @@ jobs:
           MC_PORT: '2566'
           MC_USERNAME: SASUKE_440
           MC_LOGIN_CMD: ${{ secrets.MC_LOGIN_CMD }}
+          DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
+          DISCORD_CHANNEL_ID: ${{ secrets.DISCORD_CHANNEL_ID }}
+          DISCORD_AUTHORIZED_USER_ID: ${{ secrets.DISCORD_AUTHORIZED_USER_ID }}
         run: node bot.js
+
